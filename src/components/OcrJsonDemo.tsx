@@ -35,15 +35,29 @@ function extractApiUrl() {
   return `${base}/api/extract`;
 }
 
+function hintFromHtmlErrorPage(html: string): string {
+  const title = html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1]?.trim();
+  if (title) return ` (${title})`;
+  if (html.includes("__next_error__") || html.includes("next-error")) {
+    return " (Next.js server error — the /api/extract function likely crashed; check host logs.)";
+  }
+  return "";
+}
+
 async function postExtract(formData: FormData): Promise<ExtractApiBody> {
-  const res = await fetch(extractApiUrl(), { method: "POST", body: formData });
+  const url = extractApiUrl();
+  const res = await fetch(url, { method: "POST", body: formData });
   const raw = await res.text();
   const trimmed = raw.trim();
+  const contentType = res.headers.get("content-type") ?? "";
 
   if (trimmed.startsWith("<") || trimmed.toLowerCase().startsWith("<!doctype")) {
+    const hint = hintFromHtmlErrorPage(trimmed);
     throw new Error(
-      `Server returned an HTML page instead of JSON (HTTP ${res.status}). ` +
-        `Usually the API route is not running: use a Node host (Vercel, Railway, Node Docker), not static-only hosting, or fix the site base path so /api/extract reaches Next.js.`,
+      `Server returned HTML instead of JSON (HTTP ${res.status}, ${contentType || "no Content-Type"}). ` +
+        `Request URL: ${typeof window !== "undefined" ? `${window.location.origin}${url}` : url}.${hint} ` +
+        `If you deploy under a subpath, set NEXT_PUBLIC_BASE_PATH to match next.config basePath. ` +
+        `On Vercel, a 500 often means the serverless function threw before returning JSON — see Deployment → Functions logs.`,
     );
   }
 

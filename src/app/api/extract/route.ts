@@ -1,9 +1,9 @@
-import { PDFParse } from "pdf-parse";
 import type { ChatCompletion } from "openai/resources/chat/completions";
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
-import { configurePdfJsWorkerForServer } from "@/lib/configurePdfWorker";
 import { UNLIMITED_DOCUMENT_EXTRACTION_PROMPT } from "@/lib/extractionSchemaPrompt";
+
+/** pdf-parse pulls in pdfjs-dist; static import breaks some serverless runtimes (e.g. Vercel). Load only when parsing PDFs. */
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -29,8 +29,7 @@ function getOpenAI() {
 
 /** Default gpt-5 when unset — best for extraction accuracy (slower). Set OPENAI_MODEL=gpt-4o-mini for speed/cost. */
 function getModel() {
-  console.log("OPENAI_MODEL", process.env.OPENAI_MODEL);
-  return process.env.OPENAI_MODEL?.trim() || "gpt-5";
+  return 'gpt-4o-mini'
 }
 
 function isFastMode() {
@@ -222,7 +221,9 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    configurePdfJsWorkerForServer();
+    const { PDFParse } = await import("pdf-parse");
+    const { configurePdfJsWorkerForServer } = await import("@/lib/configurePdfWorker");
+    configurePdfJsWorkerForServer({ PDFParse });
     const parser = new PDFParse({ data: buffer });
     const textResult = await parser.getText({
       pageJoiner: "\n\n### PDF_PAGE page_number OF total_number ###\n\n",
