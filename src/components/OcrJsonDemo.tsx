@@ -16,6 +16,53 @@ type ResultPayload = {
   pdfPageCount?: number;
 };
 
+type ExtractApiBody = {
+  error?: string;
+  data?: unknown;
+  model?: string;
+  kind?: "image" | "pdf";
+  inputTruncated?: boolean;
+  inputCharLimit?: number;
+  pdfPageCount?: number;
+};
+
+/**
+ * POST /api/extract must return JSON. If the host serves HTML (404/500 page, SPA fallback,
+ * static export without API routes), res.json() throws "Unexpected token '<'".
+ */
+function extractApiUrl() {
+  const base = (process.env.NEXT_PUBLIC_BASE_PATH ?? "").replace(/\/$/, "");
+  return `${base}/api/extract`;
+}
+
+async function postExtract(formData: FormData): Promise<ExtractApiBody> {
+  const res = await fetch(extractApiUrl(), { method: "POST", body: formData });
+  const raw = await res.text();
+  const trimmed = raw.trim();
+
+  if (trimmed.startsWith("<") || trimmed.toLowerCase().startsWith("<!doctype")) {
+    throw new Error(
+      `Server returned an HTML page instead of JSON (HTTP ${res.status}). ` +
+        `Usually the API route is not running: use a Node host (Vercel, Railway, Node Docker), not static-only hosting, or fix the site base path so /api/extract reaches Next.js.`,
+    );
+  }
+
+  let body: ExtractApiBody;
+  try {
+    body = JSON.parse(raw) as ExtractApiBody;
+  } catch {
+    throw new Error(
+      `Server response was not JSON (HTTP ${res.status}). Start: ${raw.slice(0, 120).replace(/\s+/g, " ")}`,
+    );
+  }
+
+  if (!res.ok) {
+    throw new Error(body.error || `Request failed (${res.status})`);
+  }
+
+  return body;
+}
+
 function buildDisplayObject(payload: ResultPayload | null): unknown | null {
   if (!payload) return null;
   return {
@@ -93,20 +140,7 @@ export function OcrJsonDemo() {
         const formData = new FormData();
         formData.append("file", file);
 
-        const res = await fetch("/api/extract", { method: "POST", body: formData });
-        const body = (await res.json()) as {
-          error?: string;
-          data?: unknown;
-          model?: string;
-          kind?: "image" | "pdf";
-          inputTruncated?: boolean;
-          inputCharLimit?: number;
-          pdfPageCount?: number;
-        };
-
-        if (!res.ok) {
-          throw new Error(body.error || `Request failed (${res.status})`);
-        }
+        const body = await postExtract(formData);
 
         const structured = body.data;
         let extractedSnippet: string | undefined;

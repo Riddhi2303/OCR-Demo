@@ -1,9 +1,10 @@
-import { PDFParse } from "pdf-parse";
 import type { ChatCompletion } from "openai/resources/chat/completions";
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI, { APIError } from "openai";
-import { configurePdfJsWorkerForServer } from "@/lib/configurePdfWorker";
 import { UNLIMITED_DOCUMENT_EXTRACTION_PROMPT } from "@/lib/extractionSchemaPrompt";
+
+/** pdf-parse pulls in pdfjs-dist; loading it at module init breaks some serverless hosts (e.g. Vercel). Import only for PDF uploads. */
+type ChatCompletionCreateParams = Parameters<OpenAI["chat"]["completions"]["create"]>[0];
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -30,7 +31,6 @@ function getOpenAI() {
 
 /** Default gpt-5 when unset — best for extraction accuracy (slower). Set OPENAI_MODEL=gpt-4o-mini for speed/cost. */
 function getModel() {
-  console.log("OPENAI_MODEL", process.env.OPENAI_MODEL);
   return process.env.OPENAI_MODEL?.trim() || "gpt-5";
 }
 
@@ -107,8 +107,32 @@ function parseAssistantJson(completion: ChatCompletion): unknown {
   }
 }
 
+/**
+ * Some model / account combinations return 400 for unknown params (e.g. reasoning_effort) or json_object.
+ * Retry with progressively simpler params so the route still returns JSON instead of crashing.
+ */
+async function chatCompletionCreate(client: OpenAI, params: ChatCompletionCreateParams): Promise<ChatCompletion> {
+  try {
+    return (await client.chat.completions.create(params)) as ChatCompletion;
+  } catch (e) {
+    if (!(e instanceof APIError) || e.status !== 400) throw e;
+    const p = params as unknown as Record<string, unknown>;
+    if (p.reasoning_effort != null) {
+      console.warn("[api/extract] OpenAI 400 — retrying without reasoning_effort");
+      const { reasoning_effort: _, ...rest } = p;
+      return chatCompletionCreate(client, rest as unknown as ChatCompletionCreateParams);
+    }
+    if (p.response_format) {
+      console.warn("[api/extract] OpenAI 400 — retrying without response_format (model must emit raw JSON)");
+      const { response_format: _, ...rest } = p;
+      return chatCompletionCreate(client, rest as unknown as ChatCompletionCreateParams);
+    }
+    throw e;
+  }
+}
+
 async function extractStructuredFromImage(client: OpenAI, model: string, base64: string, mime: string) {
-  const completion = await client.chat.completions.create({
+  const completion = await chatCompletionCreate(client, {
     model,
     ...reasoningParams(model),
     response_format: JSON_OBJECT_FORMAT,
@@ -142,7 +166,7 @@ async function extractStructuredFromPdfText(
   truncated: boolean,
   pdfPageCount: number,
 ) {
-  const completion = await client.chat.completions.create({
+  const completion = await chatCompletionCreate(client, {
     model,
     ...reasoningParams(model),
     response_format: JSON_OBJECT_FORMAT,
@@ -168,6 +192,18 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
+  try {
+    return await postExtract(req);
+  } catch (fatal) {
+    console.error("[api/extract] unhandled", fatal);
+    return NextResponse.json(
+      { error: fatal instanceof Error ? fatal.message : "Internal server error" },
+      { status: 500 },
+    );
+  }
+}
+
+async function postExtract(req: NextRequest) {
   const client = getOpenAI();
   if (!client) {
     return NextResponse.json(
@@ -226,6 +262,10 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    const [{ PDFParse }, { configurePdfJsWorkerForServer }] = await Promise.all([
+      import("pdf-parse"),
+      import("@/lib/configurePdfWorker"),
+    ]);
     configurePdfJsWorkerForServer();
     const parser = new PDFParse({ data: buffer });
     const textResult = await parser.getText({
