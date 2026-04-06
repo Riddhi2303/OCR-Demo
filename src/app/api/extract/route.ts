@@ -1,12 +1,17 @@
 import type { ChatCompletion } from "openai/resources/chat/completions";
 import { NextRequest, NextResponse } from "next/server";
-import OpenAI from "openai";
+import OpenAI, { APIError } from "openai";
 import { UNLIMITED_DOCUMENT_EXTRACTION_PROMPT } from "@/lib/extractionSchemaPrompt";
 
-/** pdf-parse pulls in pdfjs-dist; static import breaks some serverless runtimes (e.g. Vercel). Load only when parsing PDFs. */
+/** PDF text uses `unpdf` (serverless-safe). `pdf-parse` + pdf.js workers often fail only on Vercel. */
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
+export const dynamic = "force-dynamic";
+
+function isUploadFile(value: FormDataEntryValue | null): value is File {
+  return typeof value === "object" && value !== null && typeof (value as Blob).arrayBuffer === "function";
+}
 
 const MAX_BYTES = 32 * 1024 * 1024;
 
@@ -29,7 +34,7 @@ function getOpenAI() {
 
 /** Default gpt-5 when unset — best for extraction accuracy (slower). Set OPENAI_MODEL=gpt-4o-mini for speed/cost. */
 function getModel() {
-  return 'gpt-4o-mini'
+  return process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
 }
 
 function isFastMode() {
@@ -166,10 +171,25 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
+  try {
+    return await handlePost(req);
+  } catch (fatal) {
+    console.error("[api/extract] unhandled", fatal);
+    return NextResponse.json(
+      { error: fatal instanceof Error ? fatal.message : "Internal server error" },
+      { status: 500 },
+    );
+  }
+}
+
+async function handlePost(req: NextRequest) {
   const client = getOpenAI();
   if (!client) {
     return NextResponse.json(
-      { error: "Server is missing OPENAI_API_KEY. Add it to .env.local and restart the dev server." },
+      {
+        error:
+          "Server is missing OPENAI_API_KEY. Set OPENAI_API_KEY in the host environment (e.g. Vercel Project → Settings → Environment Variables) and redeploy.",
+      },
       { status: 503 },
     );
   }
@@ -185,7 +205,7 @@ export async function POST(req: NextRequest) {
   }
 
   const file = formData.get("file");
-  if (!file || !(file instanceof File)) {
+  if (!isUploadFile(file)) {
     return NextResponse.json({ error: "Missing file field" }, { status: 400 });
   }
 
@@ -196,7 +216,8 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+  const fileName = file.name;
+  const isPdf = file.type === "application/pdf" || fileName.toLowerCase().endsWith(".pdf");
   const isImage = file.type.startsWith("image/");
 
   if (!isPdf && !isImage) {
@@ -221,16 +242,19 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const { PDFParse } = await import("pdf-parse");
-    const { configurePdfJsWorkerForServer } = await import("@/lib/configurePdfWorker");
-    configurePdfJsWorkerForServer({ PDFParse });
-    const parser = new PDFParse({ data: buffer });
-    const textResult = await parser.getText({
-      pageJoiner: "\n\n### PDF_PAGE page_number OF total_number ###\n\n",
+    const { extractText } = await import("unpdf");
+    const { totalPages, text: pageTexts } = await extractText(new Uint8Array(buffer), {
+      mergePages: false,
     });
-    const pdfPageCount = textResult.total;
-    await parser.destroy();
-    const rawText = textResult.text?.trim() ?? "";
+    const pdfPageCount = totalPages;
+    const parts: string[] = [];
+    for (let i = 0; i < pageTexts.length; i++) {
+      parts.push(pageTexts[i] ?? "");
+      if (i < pageTexts.length - 1) {
+        parts.push(`\n\n### PDF_PAGE ${i + 1} OF ${pdfPageCount} ###\n\n`);
+      }
+    }
+    const rawText = parts.join("").trim();
 
     if (!rawText) {
       return NextResponse.json(
@@ -262,9 +286,24 @@ export async function POST(req: NextRequest) {
       ...(textTruncated ? { inputTruncated: true, inputCharLimit: pdfCharLimit } : {}),
     });
   } catch (e) {
+    console.error("[api/extract]", e);
+    if (e instanceof APIError) {
+      const code =
+        typeof e.status === "number" && e.status >= 400 && e.status < 600 ? e.status : 502;
+      return NextResponse.json(
+        {
+          error: e.message,
+          code: e.code ?? undefined,
+          request_id: e.requestID ?? undefined,
+        },
+        { status: code },
+      );
+    }
     const message = e instanceof Error ? e.message : "Extraction failed";
     const status =
-      message.includes("JSON") || message.includes("Empty model") || message.includes("refused") ? 502 : 500;
+      message.includes("JSON") || message.includes("Empty model") || message.includes("refused")
+        ? 502
+        : 500;
     return NextResponse.json({ error: message }, { status });
   }
 }
