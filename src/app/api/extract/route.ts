@@ -30,6 +30,7 @@ function getOpenAI() {
 
 /** Default gpt-5 when unset — best for extraction accuracy (slower). Set OPENAI_MODEL=gpt-4o-mini for speed/cost. */
 function getModel() {
+  console.log("OPENAI_MODEL", process.env.OPENAI_MODEL);
   return process.env.OPENAI_MODEL?.trim() || "gpt-5";
 }
 
