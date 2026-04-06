@@ -1,32 +1,48 @@
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { PDFParse } from "pdf-parse";
 
 let configured = false;
 
 /**
- * Resolve the worker next to the same pdfjs-dist version pdf-parse uses (often nested 5.4.x),
- * not the hoisted app dependency (e.g. 5.6.x) — mismatched API/worker versions throw at runtime.
+ * Resolve pdf.worker.mjs next to the same pdfjs-dist version pdf-parse uses.
+ * Uses package resolution from project root so production (Linux, Docker, Vercel) matches npm layout.
  */
 function resolvePdfWorkerPath(): string {
   const cwd = process.cwd();
-  const nested = join(
-    cwd,
-    "node_modules",
-    "pdf-parse",
-    "node_modules",
-    "pdfjs-dist",
-    "legacy",
-    "build",
-    "pdf.worker.mjs",
+  const pkgJson = join(cwd, "package.json");
+  if (!existsSync(pkgJson)) {
+    throw new Error(
+      `PDF worker: package.json not found at ${pkgJson}. Ensure the app runs with cwd = project root on the server.`,
+    );
+  }
+
+  const require = createRequire(pkgJson);
+  const searchRoots = [
+    join(cwd, "node_modules", "pdf-parse", "node_modules"),
+    join(cwd, "node_modules"),
+  ];
+
+  for (const root of searchRoots) {
+    if (!existsSync(root)) continue;
+    try {
+      const pkgPath = require.resolve("pdfjs-dist/package.json", { paths: [root] });
+      const worker = join(dirname(pkgPath), "legacy", "build", "pdf.worker.mjs");
+      if (existsSync(worker)) return worker;
+    } catch {
+      continue;
+    }
+  }
+
+  throw new Error(
+    "PDF worker: could not find pdfjs-dist legacy worker. On the server run `npm ci` (or `npm install`) in the app directory so node_modules/pdf-parse/node_modules/pdfjs-dist exists.",
   );
-  if (existsSync(nested)) return nested;
-  return join(cwd, "node_modules", "pdfjs-dist", "legacy", "build", "pdf.worker.mjs");
 }
 
 /**
- * pdf-parse uses pdfjs-dist/legacy; Next/Turbopack bundling breaks default worker resolution.
+ * pdf-parse uses pdfjs-dist/legacy; bundlers break default worker resolution.
  * Point GlobalWorkerOptions at the real file on disk before parsing.
  */
 export function configurePdfJsWorkerForServer() {

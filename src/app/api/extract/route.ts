@@ -1,12 +1,13 @@
 import { PDFParse } from "pdf-parse";
 import type { ChatCompletion } from "openai/resources/chat/completions";
 import { NextRequest, NextResponse } from "next/server";
-import OpenAI from "openai";
+import OpenAI, { APIError } from "openai";
 import { configurePdfJsWorkerForServer } from "@/lib/configurePdfWorker";
 import { UNLIMITED_DOCUMENT_EXTRACTION_PROMPT } from "@/lib/extractionSchemaPrompt";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
+export const dynamic = "force-dynamic";
 
 const MAX_BYTES = 32 * 1024 * 1024;
 
@@ -169,7 +170,10 @@ export async function POST(req: NextRequest) {
   const client = getOpenAI();
   if (!client) {
     return NextResponse.json(
-      { error: "Server is missing OPENAI_API_KEY. Add it to .env.local and restart the dev server." },
+      {
+        error:
+          "Server is missing OPENAI_API_KEY. Set it in the host environment (e.g. Vercel Project → Settings → Environment Variables) and redeploy.",
+      },
       { status: 503 },
     );
   }
@@ -260,6 +264,20 @@ export async function POST(req: NextRequest) {
       ...(textTruncated ? { inputTruncated: true, inputCharLimit: pdfCharLimit } : {}),
     });
   } catch (e) {
+    console.error("[api/extract]", e);
+
+    if (e instanceof APIError) {
+      const code = typeof e.status === "number" && e.status >= 400 && e.status < 600 ? e.status : 502;
+      return NextResponse.json(
+        {
+          error: e.message,
+          code: e.code ?? undefined,
+          request_id: e.requestID ?? undefined,
+        },
+        { status: code },
+      );
+    }
+
     const message = e instanceof Error ? e.message : "Extraction failed";
     const status =
       message.includes("JSON") || message.includes("Empty model") || message.includes("refused") ? 502 : 500;
