@@ -1,7 +1,11 @@
 import type { ChatCompletion } from "openai/resources/chat/completions";
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI, { APIError } from "openai";
-import { UNLIMITED_DOCUMENT_EXTRACTION_PROMPT } from "@/lib/extractionSchemaPrompt";
+import {
+  MERGE_PAGE_EXTRACTIONS_PROMPT,
+  UNLIMITED_DOCUMENT_EXTRACTION_PROMPT,
+} from "@/lib/extractionSchemaPrompt";
+import { pdfBufferToPngPages } from "@/lib/pdfPageImages";
 
 /** PDF text uses `unpdf` (serverless-safe). `pdf-parse` + pdf.js workers often fail only on Vercel. */
 
@@ -138,13 +142,101 @@ async function extractStructuredFromImage(client: OpenAI, model: string, base64:
   return parseAssistantJson(completion);
 }
 
+/** Heuristic: scanned / XFA PDFs often yield very little text per page. */
+function isSparsePdfText(rawText: string, pageCount: number): boolean {
+  if (pageCount <= 0) return false;
+  const perPage = rawText.length / pageCount;
+  return rawText.length < 500 || perPage < 120;
+}
+
+function maxVisionPages(totalPages: number): number {
+  const cap = Number(process.env.OPENAI_PDF_MAX_VISION_PAGES);
+  const n = Number.isFinite(cap) && cap > 0 ? cap : 12;
+  return Math.min(totalPages, Math.max(1, n));
+}
+
+function visionDetailForPageCount(renderedPages: number, totalPages: number): "low" | "high" | "auto" {
+  if (renderedPages > 5 || totalPages > 4) return "low";
+  return getImageDetail();
+}
+
+/** One vision call per rendered page, then one merge call → single JSON. */
+async function extractStructuredFromPdfPerPageVision(
+  client: OpenAI,
+  model: string,
+  buffer: Buffer,
+  totalPages: number,
+): Promise<{ data: unknown; imageEngine: "pdf2pic" | "unpdf"; renderedPages: number }> {
+  const maxPages = maxVisionPages(totalPages);
+  const { pages: pngPages, engine: imageEngine } = await pdfBufferToPngPages(buffer, maxPages);
+  const detail = visionDetailForPageCount(pngPages.length, totalPages);
+
+  const pageExtractions: unknown[] = [];
+  for (let i = 0; i < pngPages.length; i++) {
+    const pageNum = i + 1;
+    const b64 = pngPages[i].toString("base64");
+    const userText = isFastMode()
+      ? `PDF page ${pageNum} of ${totalPages}. Extract visible fields into JSON.`
+      : `This is page ${pageNum} of ${totalPages} from the same PDF. Extract everything visible on this page only (forms, tables, handwriting, checkboxes). Return one JSON object. Optional: include "__page": ${pageNum}. Do not invent content from other pages.`;
+
+    const completion = await client.chat.completions.create({
+      model,
+      ...reasoningParams(model),
+      response_format: JSON_OBJECT_FORMAT,
+      max_completion_tokens: getMaxCompletionTokens(model),
+      messages: [
+        { role: "system", content: UNLIMITED_DOCUMENT_EXTRACTION_PROMPT },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: userText },
+            {
+              type: "image_url",
+              image_url: { url: `data:image/png;base64,${b64}`, detail },
+            },
+          ],
+        },
+      ],
+    });
+    pageExtractions.push(parseAssistantJson(completion));
+  }
+
+  const mergeCompletion = await client.chat.completions.create({
+    model,
+    ...reasoningParams(model),
+    response_format: JSON_OBJECT_FORMAT,
+    max_completion_tokens: getMaxCompletionTokens(model),
+    messages: [
+      { role: "system", content: MERGE_PAGE_EXTRACTIONS_PROMPT },
+      {
+        role: "user",
+        content: `The PDF has ${totalPages} page(s); below are JSON extractions from ${pngPages.length} rendered page image(s) in order.\n\n${JSON.stringify({ page_extractions: pageExtractions })}\n\nReturn one merged JSON object for the full document.${totalPages > pngPages.length ? ` Note: pages ${pngPages.length + 1}–${totalPages} were not rendered; mention in transcription_notes if relevant.` : ""}`,
+      },
+    ],
+  });
+
+  return {
+    data: parseAssistantJson(mergeCompletion),
+    imageEngine,
+    renderedPages: pngPages.length,
+  };
+}
+
 async function extractStructuredFromPdfText(
   client: OpenAI,
   model: string,
   rawText: string,
   truncated: boolean,
   pdfPageCount: number,
+  sourceFileName: string,
+  sparseText: boolean,
 ) {
+  const sparseHint = sparseText
+    ? `\n\n**Sparse text warning:** The extractable text below is short for this page count (common for scanned PDFs or XFA forms). Extract every fragment; do **not** fill the JSON with only the filename or generic "submission" headers. If content is missing, say so in \`transcription_notes\` and list fragments under \`raw_text_fragments\` or similar.`
+    : "";
+
+  const nameLine = `Original file name (for context only; extract real fields from the PDF text, not from this string alone): ${sourceFileName}`;
+
   const completion = await client.chat.completions.create({
     model,
     ...reasoningParams(model),
@@ -155,8 +247,8 @@ async function extractStructuredFromPdfText(
       {
         role: "user",
         content: isFastMode()
-          ? `PDF: ${pdfPageCount} page(s). Extract key fields and tables into JSON (all pages).${truncated ? " Text was truncated." : ""}\n\n---\n${rawText}\n---`
-          : `This PDF has ${pdfPageCount} page(s) of extractable text. The text includes \`### PDF_PAGE page_number OF total_number ###\` markers between pages — process ALL pages (1 through ${pdfPageCount}). Extract the full document into rich JSON: every field, table, section, and note from every page.${truncated ? " Note: input was truncated; extract as much as possible from the text below." : ""}\n\n---\n${rawText}\n---`,
+          ? `${nameLine}\nPDF: ${pdfPageCount} page(s). Extract key fields and tables into JSON (all pages).${truncated ? " Text was truncated." : ""}${sparseHint}\n\n---\n${rawText}\n---`
+          : `${nameLine}\nThis PDF has ${pdfPageCount} page(s) of extractable text. The text includes \`### PDF_PAGE page_number OF total_number ###\` markers between pages — process ALL pages (1 through ${pdfPageCount}). Extract the full application/schedule content into rich JSON: named insureds, premises, coverages, limits, dates, amounts, tables, checkboxes, and notes — not only document titles or file-related labels.${truncated ? " Note: input was truncated; extract as much as possible from the text below." : ""}${sparseHint}\n\n---\n${rawText}\n---`,
       },
     ],
   });
@@ -256,11 +348,58 @@ async function handlePost(req: NextRequest) {
     }
     const rawText = parts.join("").trim();
 
+    const sparseText = rawText.length === 0 || isSparsePdfText(rawText, pdfPageCount);
+    const visionFallbackEnabled = process.env.OPENAI_PDF_VISION_FALLBACK !== "0";
+
+    if (sparseText && visionFallbackEnabled) {
+      try {
+        const { data, imageEngine, renderedPages } = await extractStructuredFromPdfPerPageVision(
+          client,
+          model,
+          buffer,
+          pdfPageCount,
+        );
+        const cap = maxVisionPages(pdfPageCount);
+        return NextResponse.json({
+          data,
+          model,
+          kind: "pdf" as const,
+          pdfPageCount,
+          fastMode: isFastMode(),
+          qualityMode: !isFastMode(),
+          extractedTextChars: rawText.length,
+          usedVisionFallback: true as const,
+          usedPerPageVision: true as const,
+          pdfImageEngine: imageEngine,
+          visionPagesRendered: renderedPages,
+          ...(pdfPageCount > renderedPages
+            ? {
+                visionPagesOmitted: pdfPageCount - renderedPages,
+                hint: `Raise OPENAI_PDF_MAX_VISION_PAGES to process more pages (cap ${cap}).`,
+              }
+            : {}),
+        });
+      } catch (visionErr) {
+        console.error("[api/extract] PDF vision fallback failed", visionErr);
+        if (!rawText) {
+          return NextResponse.json(
+            {
+              error:
+                "This PDF has no extractable text (likely scanned). Automatic page rendering failed.",
+              detail: visionErr instanceof Error ? visionErr.message : String(visionErr),
+            },
+            { status: 422 },
+          );
+        }
+        /* fall through to text-only path */
+      }
+    }
+
     if (!rawText) {
       return NextResponse.json(
         {
           error:
-            "No extractable text in this PDF (it may be scanned). Try uploading page images with OpenAI mode instead.",
+            "No extractable text in this PDF (it may be scanned). Set OPENAI_PDF_VISION_FALLBACK=1 or upload page images.",
         },
         { status: 422 },
       );
@@ -275,6 +414,8 @@ async function handlePost(req: NextRequest) {
       header + bodyText,
       textTruncated,
       pdfPageCount,
+      fileName,
+      isSparsePdfText(rawText, pdfPageCount),
     );
     return NextResponse.json({
       data,
@@ -283,6 +424,8 @@ async function handlePost(req: NextRequest) {
       pdfPageCount,
       fastMode: isFastMode(),
       qualityMode: !isFastMode(),
+      extractedTextChars: rawText.length,
+      ...(isSparsePdfText(rawText, pdfPageCount) ? { pdfTextLikelyIncomplete: true as const } : {}),
       ...(textTruncated ? { inputTruncated: true, inputCharLimit: pdfCharLimit } : {}),
     });
   } catch (e) {

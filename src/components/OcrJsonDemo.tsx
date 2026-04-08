@@ -14,6 +14,16 @@ type ResultPayload = {
   inputTruncated?: boolean;
   inputCharLimit?: number;
   pdfPageCount?: number;
+  pdfTextLikelyIncomplete?: boolean;
+  extractedTextChars?: number;
+  usedVisionFallback?: boolean;
+  usedPerPageVision?: boolean;
+  pdfImageEngine?: "pdf2pic" | "unpdf";
+  visionPagesRendered?: number;
+  visionPagesOmitted?: number;
+  hint?: string;
+  /** PDF rasterized in-browser (pdf.js) then vision + merge — works on Vercel. */
+  usedClientPdfRasterization?: boolean;
 };
 
 type ExtractApiBody = {
@@ -24,6 +34,21 @@ type ExtractApiBody = {
   inputTruncated?: boolean;
   inputCharLimit?: number;
   pdfPageCount?: number;
+  /** Server heuristic: little text per page (often scanned / XFA). */
+  pdfTextLikelyIncomplete?: boolean;
+  extractedTextChars?: number;
+  usedVisionFallback?: boolean;
+  usedPerPageVision?: boolean;
+  pdfImageEngine?: "pdf2pic" | "unpdf";
+  visionPagesRendered?: number;
+  visionPagesOmitted?: number;
+  hint?: string;
+};
+
+type MergeApiBody = {
+  error?: string;
+  data?: unknown;
+  model?: string;
 };
 
 /**
@@ -33,6 +58,38 @@ type ExtractApiBody = {
 function extractApiUrl() {
   const base = (process.env.NEXT_PUBLIC_BASE_PATH ?? "").replace(/\/$/, "");
   return `${base}/api/extract`;
+}
+
+function mergeApiUrl() {
+  const base = (process.env.NEXT_PUBLIC_BASE_PATH ?? "").replace(/\/$/, "");
+  return `${base}/api/extract/merge`;
+}
+
+async function postMergeExtractions(extractions: unknown[]): Promise<MergeApiBody> {
+  const res = await fetch(mergeApiUrl(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ extractions }),
+  });
+  const raw = await res.text();
+  const trimmed = raw.trim();
+
+  if (trimmed.startsWith("<") || trimmed.toLowerCase().startsWith("<!doctype")) {
+    throw new Error(`Merge API returned HTML (HTTP ${res.status}).`);
+  }
+
+  let body: MergeApiBody;
+  try {
+    body = JSON.parse(raw) as MergeApiBody;
+  } catch {
+    throw new Error(`Merge response was not JSON (HTTP ${res.status}).`);
+  }
+
+  if (!res.ok) {
+    throw new Error(body.error || `Merge failed (${res.status})`);
+  }
+
+  return body;
 }
 
 function hintFromHtmlErrorPage(html: string): string {
@@ -87,6 +144,28 @@ function buildDisplayObject(payload: ResultPayload | null): unknown | null {
     ...(payload.inputTruncated
       ? {
           warning: `PDF text was truncated at ${payload.inputCharLimit ?? "?"} characters before sending to the model. Raise MAX_PDF_INPUT_CHARS on the server if needed.`,
+        }
+      : {}),
+    ...(payload.usedVisionFallback
+      ? {
+          pdf_vision_pipeline:
+            payload.usedPerPageVision
+              ? `Per-page vision (${payload.pdfImageEngine ?? "?"}): ${String(payload.visionPagesRendered ?? "?")} page image(s), each sent to the model, then merged.${payload.visionPagesOmitted != null && payload.visionPagesOmitted > 0 ? ` ${String(payload.visionPagesOmitted)} page(s) omitted — ${payload.hint ?? "raise OPENAI_PDF_MAX_VISION_PAGES"}.` : ""}`
+              : payload.visionPagesOmitted != null && payload.visionPagesOmitted > 0
+                ? `Scanned PDF: ${String(payload.visionPagesRendered ?? "?")} page image(s). ${String(payload.visionPagesOmitted)} not rendered — ${payload.hint ?? "raise OPENAI_PDF_MAX_VISION_PAGES"}.`
+                : `Scanned PDF: ${String(payload.visionPagesRendered ?? "?")} page image(s) sent to the vision model.`,
+        }
+      : {}),
+    ...(payload.pdfTextLikelyIncomplete && !payload.usedVisionFallback
+      ? {
+          warning_sparse_pdf:
+            `Extracted only ${payload.extractedTextChars ?? "?"} characters of text from ${payload.pdfPageCount ?? "?"} PDF page(s). This usually means the file is scanned (image-only) or uses XFA/forms without a normal text layer. For full data, upload page images or a text-based PDF.`,
+        }
+      : {}),
+    ...(payload.usedClientPdfRasterization
+      ? {
+          client_pdf_pipeline:
+            "PDF was rasterized in your browser (pdf.js), each page sent to vision, then merged on the server. No GraphicsMagick or server canvas required.",
         }
       : {}),
     extraction: payload.structured,
@@ -150,6 +229,56 @@ export function OcrJsonDemo() {
           setPreviewUrl(null);
         }
 
+        const useClientPdfRaster =
+          isPdf && (process.env.NEXT_PUBLIC_PDF_CLIENT_RASTER === undefined || process.env.NEXT_PUBLIC_PDF_CLIENT_RASTER !== "0");
+
+        if (useClientPdfRaster) {
+          try {
+            const maxPages = Number(process.env.NEXT_PUBLIC_PDF_CLIENT_MAX_PAGES) || 15;
+            setProgress("Rendering PDF in your browser (pdf.js)…");
+            const { renderPdfFileToPngDataUrls } = await import("@/lib/pdfToImagesBrowser");
+            const dataUrls = await renderPdfFileToPngDataUrls(file, maxPages);
+            if (dataUrls.length === 0) throw new Error("No pages rendered from PDF");
+
+            const pageExtractions: unknown[] = [];
+            for (let i = 0; i < dataUrls.length; i++) {
+              setProgress(`Vision: page ${i + 1} of ${dataUrls.length}…`);
+              const blob = await fetch(dataUrls[i]).then((r) => r.blob());
+              const fd = new FormData();
+              fd.append("file", new File([blob], `page-${i + 1}.png`, { type: "image/png" }));
+              const part = await postExtract(fd);
+              if (part.data === undefined && part.error) throw new Error(part.error);
+              pageExtractions.push(part.data);
+            }
+
+            setProgress("Merging pages…");
+            const merged = await postMergeExtractions(pageExtractions);
+            const structured = merged.data;
+            let extractedSnippet: string | undefined;
+            if (structured && typeof structured === "object") {
+              const o = structured as Record<string, unknown>;
+              if (typeof o.full_text === "string") extractedSnippet = o.full_text;
+              else if (typeof o.transcription_notes === "string") extractedSnippet = o.transcription_notes;
+            }
+
+            setPreviewUrl(dataUrls[0] ?? null);
+            setRawResult({
+              source: { fileName: file.name, mimeType: "application/pdf" },
+              processing: "openai-pdf",
+              openAiModel: merged.model,
+              structured,
+              extractedText: extractedSnippet,
+              pdfPageCount: dataUrls.length,
+              usedClientPdfRasterization: true,
+            });
+            setProgress("");
+            return;
+          } catch (clientPdfErr) {
+            console.warn("[OcrJsonDemo] client PDF pipeline failed, falling back to server:", clientPdfErr);
+            setProgress("Browser PDF path failed — trying server…");
+          }
+        }
+
         setProgress("Processing…");
         const formData = new FormData();
         formData.append("file", file);
@@ -173,6 +302,14 @@ export function OcrJsonDemo() {
           inputTruncated: body.inputTruncated,
           inputCharLimit: body.inputCharLimit,
           pdfPageCount: body.pdfPageCount,
+          pdfTextLikelyIncomplete: body.pdfTextLikelyIncomplete,
+          extractedTextChars: body.extractedTextChars,
+          usedVisionFallback: body.usedVisionFallback,
+          usedPerPageVision: body.usedPerPageVision,
+          pdfImageEngine: body.pdfImageEngine,
+          visionPagesRendered: body.visionPagesRendered,
+          visionPagesOmitted: body.visionPagesOmitted,
+          hint: body.hint,
         });
         setProgress("");
       } catch (e) {
@@ -237,7 +374,11 @@ export function OcrJsonDemo() {
             ) : rawResult?.source.mimeType.includes("pdf") ? (
               <div className="p-6 text-center text-sm text-zinc-500 dark:text-zinc-400">
                 <p className="font-medium text-foreground">{rawResult.source.fileName}</p>
-                <p className="mt-2">PDF — processed on the server.</p>
+                <p className="mt-2">
+                  {rawResult.usedClientPdfRasterization
+                    ? "PDF — pages rendered in your browser, then vision + merge."
+                    : "PDF — processed on the server."}
+                </p>
               </div>
             ) : (
               <p className="px-4 text-center text-sm text-zinc-500 dark:text-zinc-400">
